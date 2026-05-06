@@ -4,6 +4,14 @@ const WHITELISTED_TEST_PHONES = new Set<string>([
   "905365575190",
 ]);
 
+/** Bu IP’ler için demo arama sayacı / kota uygulanmaz (kurulum ve VIP erişim). */
+const WHITELISTED_IPS = new Set<string>(["188.119.40.45"]);
+
+export function isWhitelistedIp(ip: string): boolean {
+  const trimmed = ip.trim();
+  return trimmed.length > 0 && WHITELISTED_IPS.has(trimmed);
+}
+
 type RateStore = {
   counters: Map<string, number>;
   grants: Map<string, { ip: string; phone: string; expiresAt: number }>;
@@ -72,6 +80,14 @@ export function issueRateGrant(input: { ip: string; phone?: string }): {
   }
 
   const ip = input.ip || "unknown";
+  if (isWhitelistedIp(ip)) {
+    return {
+      ok: true,
+      grantId: `grant_whitelist_ip_${Date.now()}`,
+      remaining: MAX_DEMO_CALLS,
+    };
+  }
+
   const phone = normalizePhone(input.phone);
   const ipCount = getCount(keyIp(ip));
   const phoneCount = phone ? getCount(keyPhone(phone)) : 0;
@@ -111,6 +127,10 @@ export function consumeRateGrant(input: {
   }
 
   const ip = input.ip || "unknown";
+  if (isWhitelistedIp(ip)) {
+    return { ok: true, remaining: MAX_DEMO_CALLS };
+  }
+
   const phone = normalizePhone(input.phone);
   cleanupGrants();
 

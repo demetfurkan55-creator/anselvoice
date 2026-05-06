@@ -1,28 +1,54 @@
 import { NextResponse } from "next/server";
+import type { CallLocale } from "@/lib/callLocale";
+import { blockedSiteMessage } from "@/lib/blockedMessages";
 import {
   consumeRateGrant,
   getClientIpFromHeaders,
 } from "../../lib/demoCallRateLimit";
+import { ANSEL_CALL_SYSTEM_BOUNDARY } from "../../lib/anselCallPromptBoundary";
+import { blockIpPersist, isIpBlocked } from "../../lib/ipBlocklist";
+import {
+  abuseMessageForLocale,
+  scanPromptForAbuse,
+} from "../../lib/promptAbuseGuard";
+import {
+  appendSecurityToSystemPrompt,
+  endCallMessageForLocale,
+  MAX_CALL_DURATION_SECONDS,
+  VAPI_END_CALL_PHRASES,
+} from "../../lib/voiceCallSecurity";
+import { augmentCustomScenarioDraft } from "../../lib/voiceDemoPrompts";
 
 /** Vapi Create Call — birleşik endpoint (outbound PSTN). */
 const VAPI_CREATE_CALL_URL = "https://api.vapi.ai/call";
 const VAPI_GET_ASSISTANT_URL = (id: string) =>
   `https://api.vapi.ai/assistant/${encodeURIComponent(id)}`;
 
-type CallLocale = "tr" | "en" | "de";
-type CallSector = "ecommerce" | "realestate" | "health";
+type CallSector = "language" | "ecom" | "clinic";
 
 /** İstemciden gelen locale + sunucu tarafı dil kilidi (UI ile uyum). */
 const SERVER_LOCALE_LOCK: Record<CallLocale, string> = {
   tr:
-    "[SUNUCU — DİL KİLİT] Bu oturum için arayüz dili Türkçe. Tüm yanıtlar yalnızca Türkçe olmalıdır.",
+    "[SUNUCU — DİL KİLİDİ] Varsayılan: akıcı kurumsal Türkçe. İstisna: sistem promptundaki özel senaryo açıkça yabancı dilde öğretim/pratik (ör. İngilizce ders) gerektiriyorsa o içeriği hedef dilde yürüt; ‘yalnızca Türkçe’ deme.",
   en:
-    "[SERVER — LANGUAGE LOCK] UI locale is English for this session. Every reply must be in English only.",
+    "[SERVER — LANGUAGE LOCK] Default: idiomatic English. Exception: if the scenario text explicitly requires Turkish or another language for tutoring/practice, use that language for the instructional segments—never refuse with ‘English only’.",
   de:
-    "[SERVER — SPRACHSPERRE] UI auf Deutsch. Alle Antworten ausschließlich auf Deutsch.",
+    "[SERVER — SPRACHSPERRE] Standard: Hochdeutsch. Ausnahme: wenn die Szenario-Beschreibung ausdrücklich Fremdsprachenunterricht (z. B. Englisch) verlangt, Unterricht in der Zielsprache führen — nicht mit ‘nur Deutsch’ blockieren.",
 };
 
 /** Vapi genelde E.164 bekler (+ülke kodu). Türkiye için 05xx / 5xx / 90xx yaygın girişleri düzeltir. */
+const MAX_CUSTOM_FIRST_MESSAGE = 420;
+
+/** İstemciden gelen ilk cümleyi güvenli biçimde kısıtla (ör. Caller name ile kişiselleştirilmiş giden arama). */
+function sanitizeOutboundFirstMessage(raw: string): string | null {
+  const s = raw.trim();
+  if (!s || s.length > MAX_CUSTOM_FIRST_MESSAGE) return null;
+  if (!/^[\p{L}\p{N}\s.,;:!?'’`\-–—()[\]/?]+$/u.test(s)) {
+    return null;
+  }
+  return s;
+}
+
 function normalizePhoneE164(raw: string): string | null {
   const trimmed = raw.trim();
   if (!trimmed) return null;
@@ -55,6 +81,23 @@ function normalizePhoneE164(raw: string): string | null {
   return null;
 }
 
+/**
+ * DE/EN arayüzünde Almanya (+49) numaraları için bazı santraller + yerine 00 ile uluslararası biçimi bekler.
+ * Örn. +49 151 2345678 → 00491512345678 (E.164’daki + ve ülke kodu korunarak 00 öneklenir).
+ */
+function formatGermanDialForCarrier(e164: string, locale: CallLocale): string {
+  if (locale !== "de" && locale !== "en") return e164;
+  const digits = e164.replace(/^\+/, "").replace(/\D/g, "");
+  if (
+    !digits.startsWith("49") ||
+    digits.length < 11 ||
+    digits.length > 15
+  ) {
+    return e164;
+  }
+  return `00${digits}`;
+}
+
 function parseCallLocale(body: unknown): CallLocale {
   if (
     body &&
@@ -65,11 +108,25 @@ function parseCallLocale(body: unknown): CallLocale {
     const raw = (body as { locale: string }).locale.trim().toLowerCase();
     if (raw === "tr" || raw === "en" || raw === "de") return raw;
   }
-  return "tr";
+  return "en";
 }
 
 function resolveCallLocale(body: unknown): CallLocale {
   return parseCallLocale(body);
+}
+
+function parsePresetId(body: unknown): string | null {
+  if (body && typeof body === "object") {
+    const o = body as { presetId?: unknown; isCustomScenario?: unknown };
+    if (typeof o.presetId === "string") {
+      const id = o.presetId.trim().toLowerCase();
+      if (id) return id;
+    }
+    if (o.isCustomScenario === true) {
+      return "custom";
+    }
+  }
+  return null;
 }
 
 function parseCallSector(body: unknown): CallSector | null {
@@ -80,27 +137,11 @@ function parseCallSector(body: unknown): CallSector | null {
     typeof (body as { sector?: unknown }).sector === "string"
   ) {
     const raw = (body as { sector: string }).sector.trim().toLowerCase();
-    if (
-      raw === "ecommerce" ||
-      raw === "realestate" ||
-      raw === "health"
-    ) {
-      return raw;
-    }
+    if (raw === "language" || raw === "ecom" || raw === "clinic") return raw;
+    if (raw === "ecommerce") return "ecom";
+    if (raw === "health") return "clinic";
   }
   return null;
-}
-
-/** ElevenLabs `language` alanı için ISO 639-1. */
-function localeToVoiceLanguage(locale: CallLocale): string {
-  switch (locale) {
-    case "de":
-      return "de";
-    case "en":
-      return "en";
-    default:
-      return "tr";
-  }
 }
 
 /** Dashboard’daki asistanın `model` ve `voice` blokları (override birleşimi için). */
@@ -175,24 +216,24 @@ function buildTranscriberOverride(
 }
 
 /**
- * Ses: mümkünse ElevenLabs ile dile göre `language` (turbo v2.5).
- * İsteğe bağlı: `.env.local` içinde kadın ses — `VAPI_VOICE_PROVIDER=11labs` + `VAPI_VOICE_VOICE_ID=<ElevenLabs ses id>`.
+ * ElevenLabs — Sarah (premium); `eleven_turbo_v2_5` çok dilli düşük gecikme.
+ * TR/EN/DE prompt/firstMessage dilini takip eder; voice için ayrı language kodu gönderilmez.
+ * Vapi’de ElevenLabs sağlayıcı kimliği `11labs` (docs.vapi.ai/providers/voice/elevenlabs).
+ * İsteğe bağlı: `VAPI_VOICE_VOICE_ID`, `VAPI_VOICE_MODEL` ile geçici override.
  */
-function buildVoiceOverride(
-  locale: CallLocale,
-  forcedVoiceId: string,
-): Record<string, unknown> | undefined {
-  const lang = localeToVoiceLanguage(locale);
-  const voice: Record<string, unknown> = {
+const ELEVENLABS_VOICE_ID_SARAH = "EXAVITQu4vr4xnSDxMaL";
+const ELEVENLABS_VOICE_MODEL_DEFAULT = "eleven_turbo_v2_5";
+
+function buildVoiceOverride(resolvedVoiceId: string): Record<string, unknown> {
+  const voiceId =
+    resolvedVoiceId.trim() || ELEVENLABS_VOICE_ID_SARAH;
+  const model =
+    process.env.VAPI_VOICE_MODEL?.trim() || ELEVENLABS_VOICE_MODEL_DEFAULT;
+  return {
     provider: "11labs",
-    voiceId: forcedVoiceId,
-    language: lang,
+    voiceId,
+    model,
   };
-  const modelFromEnv = process.env.VAPI_VOICE_MODEL?.trim();
-  if (modelFromEnv) {
-    voice.model = modelFromEnv;
-  }
-  return voice;
 }
 
 function buildLanguagePrompts(locale: CallLocale): {
@@ -203,23 +244,23 @@ function buildLanguagePrompts(locale: CallLocale): {
     case "de":
       return {
         firstMessage:
-          "Hallo, ich bin Ansel AI. Wie kann ich Ihre Geschäftsprozesse heute optimieren?",
+          "Guten Tag, hier ist Ansel AI — die konversationelle KI für Ihre geschäftskritischen Telefonprozesse. Womit darf ich Ihnen konkret weiterhelfen?",
         systemPrompt:
-          "Du bist Ansel AI, ein professioneller KI-Assistent für Unternehmen. Sprich NUR auf Deutsch. Sprich natürlich, warm und menschlich — nicht wie ein Bot. Formuliere grammatikalisch korrektes, leicht verständliches Hochdeutsch ohne Dialekt, Slang oder unnötig komplizierte Formulierungen. Nutze klare, kurze Sätze, variiere den Rhythmus leicht und setze kleine natürliche Pausen. Sprich präzise, freundlich und souverän.",
+          "Du bist Ansel AI, eine höfliche, entscheidungsfähige Enterprise-Sprachassistentin. Sprich ausnahmslos Hochdeutsch. Führe das Gespräch wie eine erfahrene Beraterin am Telefon: warm, präzise, souverän; normales bis leicht zügiges Tempo — niemals langsam gezogen, nicht nuscheln, keine künstlichen Füllwörter. Artikuliere jedes Wort klar (Konsonanten und Umlaute deutlich); keine Stockungen oder neuen Anläufe. Kurze, belastbare Sätze; keine unnötig verschachtelten Nebensätze. Tonfall ruhig und stabil — nicht wie eine monotone Mailbox.",
       };
     case "en":
       return {
         firstMessage:
-          "Hello, I am Ansel AI. How can I optimize your business processes today?",
+          "Hi, this is Ansel AI—a voice assistant built for disciplined enterprise workflows. Where should we focus this session?",
         systemPrompt:
-          "You are Ansel AI, an enterprise AI assistant. Speak ONLY in English. Sound natural, warm, and human — never robotic. Use clear international business English with correct grammar and straightforward wording. Avoid slang, filler words, and overly complex sentence structures. Keep sentences concise, vary cadence slightly, and include brief natural pauses. Be polite, professional, and precise.",
+          "You are Ansel AI: a senior enterprise voice collaborator. Speak only polished, conversational English tailored to global B2B buyers. Pace is confident and conversational—never sluggish, drawling, or robotic. Articulate clearly for voice: crisp consonants, full vowels, no mumbling or swallowed endings; no verbal fillers or hesitation glitches. Prefer short, high-signal sentences; avoid filler jargon. Stay courteous, factual, calm, and adaptable while steering toward the outcome the user chose.",
       };
     default:
       return {
         firstMessage:
-          "Merhaba, ben Ansel AI. Bugün iş süreçlerinizi nasıl optimize edebilirim?",
+          "Merhaba, Ansel AI sesli iş asistanınız olarak hattayım — hangi süreci önceliklendirelim?",
         systemPrompt:
-          "Sen Ansel AI, kurumsal bir yapay zeka asistanısın. SADECE Türkçe konuş. Sesin doğal, sıcak ve insan gibi olsun; robotik tondan kaçın. Enerjik ama kontrollü konuş, canlı bir ton kullan, kelimeleri net ve anlaşılır telaffuz et. Çok yavaş veya çok hızlı konuşma; akıcı ve anlaşılır tempoda ilerle. Kibar, profesyonel ve net ol.",
+          "Sen Ansel AI, kurumsal bir ses yapay zekâsısın. YALNIZCA Türkçe konuş. Profesyonel bir müşteri temsilcisinin netliğinde ol: doğal, güven veren, çözüm odaklı; tempo orta–hafif hızlı, gevelemeden. Her kelimeyi eksiksiz telaffuz et; takılma, kekeleme ve gereksiz dolgu yok. Kısa ve anlaşılır cümleler kur; robotik monotonluktan kaçın. Karşı tarafı dinle, gerektiğinde tek cümlede özetle ve nazikçe doğrula.",
       };
   }
 }
@@ -230,98 +271,98 @@ function buildSectorPrompts(locale: CallLocale, sector: CallSector): {
 } {
   if (locale === "en") {
     switch (sector) {
-      case "ecommerce":
+      case "language":
         return {
           firstMessage:
-            "Hi there! This is Ansel AI's e-commerce specialist. How can we reduce cart abandonment and increase your sales?",
+            "Hello, I am your Ansel language partner. Which language would you like to practice today?",
           systemPrompt:
-            "You are an e-commerce specialist. You are highly skilled in stock tracking, order status support, and campaign management.",
+            "You are a language learning partner. Practice with the user and correct mistakes kindly.",
         };
-      case "realestate":
+      case "ecom":
         return {
           firstMessage:
-            "Hello, this is your Ansel AI real-estate assistant. How should we automate appointment booking for your listings?",
+            "Welcome to Ansel Support, how can I assist you with your order?",
           systemPrompt:
-            "You are a real-estate specialist. You are skilled at qualifying buyers and scheduling home-showing appointments.",
+            "You are an e-commerce support agent. Help customers with orders.",
         };
-      case "health":
+      case "clinic":
         return {
           firstMessage:
-            "Good day, this is Ansel AI's healthcare assistant. How can we speed up patient appointments and clinic information workflows?",
+            "Hello, Ansel Dental Practice, how can I help you today?",
           systemPrompt:
-            "You are a clinical assistant. You prioritize patient privacy, manage appointment calendars, and answer questions politely.",
+            "You are an assistant in a dental practice. Handle appointment requests friendly.",
         };
       default:
         return {
           firstMessage:
-            "Hi there! This is Ansel AI's e-commerce specialist. How can we reduce cart abandonment and increase your sales?",
+            "Welcome to Ansel Support, how can I assist you with your order?",
           systemPrompt:
-            "You are an e-commerce specialist. You are highly skilled in stock tracking, order status support, and campaign management.",
+            "You are an e-commerce support agent. Help customers with orders.",
         };
     }
   }
 
   if (locale === "de") {
     switch (sector) {
-      case "ecommerce":
+      case "language":
         return {
           firstMessage:
-            "Hallo! Hier ist der E-Commerce-Spezialist von Ansel AI. Wie können wir Warenkorbabbrüche senken und Ihren Umsatz steigern?",
+            "Hallo, ich bin Ihr Ansel Sprachlern-Partner. Welche Sprache möchten Sie heute üben?",
           systemPrompt:
-            "Du bist ein E-Commerce-Spezialist. Du bist erfahren in Bestandsverwaltung, Bestellstatus und Kampagnenmanagement.",
+            "Du bist ein Sprachlern-Partner. Übe mit dem Nutzer und korrigiere Fehler freundlich.",
         };
-      case "realestate":
+      case "ecom":
         return {
           firstMessage:
-            "Hallo, ich bin Ihr Immobilien-Assistent von Ansel AI. Wie sollen wir die Terminbuchung für Ihre Immobilien automatisieren?",
+            "Willkommen beim Ansel Support. Wie kann ich Ihnen bei Ihrer Bestellung helfen?",
           systemPrompt:
-            "Du bist ein Immobilien-Spezialist. Du qualifizierst Interessenten und koordinierst Besichtigungstermine effizient.",
+            "Du bist ein E-Commerce-Support-Agent. Hilf Kunden bei Bestellungen.",
         };
-      case "health":
+      case "clinic":
         return {
           firstMessage:
-            "Guten Tag, hier ist der Gesundheitsassistent von Ansel AI. Wie können wir Patienten-Termine und Informationsprozesse in Ihrer Klinik beschleunigen?",
+            "Hallo, Praxis Dr. Ansel, wie kann ich Ihnen helfen?",
           systemPrompt:
-            "Du bist ein klinischer Assistent. Du achtest auf Datenschutz, verwaltest Terminpläne und beantwortest Fragen freundlich.",
+            "Du bist eine Assistenz in einer Zahnarztpraxis. Nimm Terminwünsche freundlich entgegen.",
         };
       default:
         return {
           firstMessage:
-            "Hallo! Hier ist der E-Commerce-Spezialist von Ansel AI. Wie können wir Warenkorbabbrüche senken und Ihren Umsatz steigern?",
+            "Willkommen beim Ansel Support. Wie kann ich Ihnen bei Ihrer Bestellung helfen?",
           systemPrompt:
-            "Du bist ein E-Commerce-Spezialist. Du bist erfahren in Bestandsverwaltung, Bestellstatus und Kampagnenmanagement.",
+            "Du bist ein E-Commerce-Support-Agent. Hilf Kunden bei Bestellungen.",
         };
     }
   }
 
   switch (sector) {
-    case "ecommerce":
+    case "language":
       return {
         firstMessage:
-          "Selamlar! Ansel AI e-ticaret uzmanı burada. Sepet terk etme oranlarınızı düşürmek ve satışlarınızı artırmak için neler yapabiliriz?",
+          "Merhaba, ben Ansel dil öğrenme partneriniz. Hangi dilde pratik yapmak istersiniz?",
         systemPrompt:
-          "Sen bir e-ticaret uzmanısın. Stok takibi, sipariş durumu ve kampanya yönetimi konularında uzmanlaşmış bir asistansın.",
+          "Sen bir dil öğrenme partnerisin. Kullanıcıyla hedef dilde pratik yap ve hataları nazikçe düzelt.",
       };
-    case "realestate":
+    case "ecom":
       return {
         firstMessage:
-          "Merhaba, Ansel AI emlak asistanı olarak aramanıza sevindim. Portföyünüzdeki ilanlar için randevu alma sürecini nasıl otomatize edelim?",
+          "Ansel Destek hattına hoş geldiniz, siparişinizle ilgili nasıl yardımcı olabilirim?",
         systemPrompt:
-          "Sen bir emlak uzmanısın. Potansiyel alıcıları filtreleme ve ev gösterimi için randevu oluşturma konusunda uzmansın.",
+          "Sen bir e-ticaret destek asistanısın. Müşterilere yardımcı ol.",
       };
-    case "health":
+    case "clinic":
       return {
         firstMessage:
-          "İyi günler, Ansel AI sağlık asistanı ben. Kliniğiniz için hasta randevularını ve genel bilgilendirme süreçlerini nasıl hızlandırabiliriz?",
+          "Merhaba, Ansel Diş Kliniği, size nasıl yardımcı olabilirim?",
         systemPrompt:
-          "Sen bir klinik asistanısın. Hasta gizliliğine önem veren, randevu takvimi yöneten ve nezaketle soruları yanıtlayan birisin.",
+          "Sen bir diş kliniği asistanısın. Randevu taleplerini kibarca karşıla.",
       };
     default:
       return {
         firstMessage:
-          "Selamlar! Ansel AI e-ticaret uzmanı burada. Sepet terk etme oranlarınızı düşürmek ve satışlarınızı artırmak için neler yapabiliriz?",
+          "Ansel Destek hattına hoş geldiniz, siparişinizle ilgili nasıl yardımcı olabilirim?",
         systemPrompt:
-          "Sen bir e-ticaret uzmanısın. Stok takibi, sipariş durumu ve kampanya yönetimi konularında uzmanlaşmış bir asistansın.",
+          "Sen bir e-ticaret destek asistanısın. Müşterilere yardımcı ol.",
       };
   }
 }
@@ -374,65 +415,147 @@ function enhancePromptForVoiceCall(
         "Bu bir CANLI TELEFON görüşmesidir.",
         "Aşağıdaki «KULLANICI TANIMI» bloğu görevini, kişiliğini ve konuşma tarzını belirler — dashboard varsayılanından ÜSTÜNDÜR.",
         "Genel «yapay zeka asistanı» şablonuna kayma; kullanıcı rolünü somut uygula.",
+        "Senaryo seni arayan taraf olarak tanımlamıyorsa, giden arama gibi davran: karşı taraf uzun süre konuşsun diye bekleme — dolu bir açılış yap veya tek net soruyla ilerlet.",
+        "Kullanıcı tanımı çok kısa olsa bile anlamı çıkarıp profesyonel bir çağrı akışına genişlet; somut uydurma veri üretme.",
         "İlk ne söylersen söyle, sonra da bu role uy; sessiz kalma — gerektiğinde kısa bir soruyla konuşmayı sürdür.",
       ].join("\n"),
       [
-        "### SESLI CAGRI STILI",
-        "Robotik ve liste okur gibi konusma.",
-        "Kisa ve konusma diliyle cumleler kur; akisa gore dogal baglaclar kullan.",
-        "Her cumlede ayni ritmi kullanma; tonlamayi yumusat.",
-        "Hiz: orta ve canli. Kelimeleri net telaffuz et.",
-        "Cumleler arasina kisa, dogal duraklama koy.",
-        "Belirlenen dilde kal.",
+        "### SESLİ ÇAĞRI STİLİ",
+        "Telefonu arayan sıradan insan gibi: tempolu ve net konuş; yavaş, ağır, tembel veya uyku veren ton kesinlikle yok.",
+        "Takılma, ıı-şey dolgusu, cümleyi yarıda kesip yeniden başlama yok; akıcı ve kararlı akış.",
+        "Hece uzatmadan konuş; kelimeleri ağızda gevelemeden bitir.",
+        "Ses çıktısı için ana dil konuşuru kalitesinde artikülasyon: ünlü ve ünsüzleri net ver; dinleyici hiçbir heceyi kaçırmamalı.",
+        "Kısa net cümleler; dolambaç, liste okurmuş gibi okuma yok.",
+        "Ritim canlı ve stabil — robot gibi düz ezber değil.",
+        "Dil: varsayılan Türkçe; kullanıcı metni açıkça yabancı dilde öğretim/pratik istiyorsa o hedef dilde devam et.",
       ].join("\n"),
     ],
     en: [
       [
         "### PRIORITY (absolute)",
         "This is a LIVE PHONE call.",
-        "The «USER PERSONA» block below defines task, personality, and tone — it OVERRIDES generic dashboard instructions.",
+        "The «USER PERSONA & TASK» block below defines task, personality, and tone — it OVERRIDES generic dashboard instructions.",
         "Do not use a bland generic-assistant script; fully embody the described role.",
+        "Unless the scenario explicitly casts you as inbound support only, behave outbound: do not wait for the callee to carry the opening—deliver a full first turn (or one crisp question) without awkward silence.",
+        "If the user’s scenario text is very short, infer intent and expand into a strong phone flow—never invent specific facts (names, dates, amounts).",
         "Never go silent indefinitely—if the user is quiet, move the conversation forward with one focused question.",
       ].join("\n"),
       [
         "### VOICE CALL STYLE",
-        "Use clean, easy-to-understand international English.",
-        "Prefer short, direct sentences and concrete wording.",
-        "Avoid slang, idioms, and long nested sentence structures.",
-        "Keep a steady, natural pace with brief pauses.",
-        "One focused question at a time when needed.",
-        "Follow the agreed interface language.",
+        "Sound like an everyday fluent speaker on a normal call—never slow, lazy, drawling, or stammering.",
+        "No filler clutter, no stuck restarts mid-sentence; keep momentum.",
+        "Crisp articulation, short clauses; no rambling paragraphs.",
+        "Broadcast-grade clarity for TTS: finish each word cleanly—no blurred consonants, no swallowed word endings.",
+        "Steady, slightly upbeat pace; brief pauses only where natural.",
+        "One focused question at a time.",
+        "Language: default English; if the persona text explicitly requires another language for tutoring/practice, use that for the lesson segments.",
       ].join("\n"),
     ],
     de: [
       [
-        "### PRIORITÄT",
+        "### PRIORITÄT (absolut)",
         "Live‑Telefonat.",
-        "Der Block «NUTZERROLLE» unten hat Vorrang vor generischen Dashboard‑Texten.",
+        "Der Block «NUTZERROLLE UND AUFGABE» unten hat Vorrang vor generischen Dashboard‑Texten.",
         "Rolle konkret ausfüllen, nicht nur höflich grüßen.",
+        "Wenn das Szenario dich nicht ausdrücklich nur als eingehende Support‑Leitung beschreibt, verhalte dich wie bei einem Ausgangs­anruf: nicht nach einem bloßen Gruß in Peinlich‑Stille verharren — liefere eine vollständige Eröffnung oder eine klare Erstfrage.",
+        "Ist der Nutzertext sehr kurz, Intention erkennen und zu einem starken Telefonablauf ausbauen — keine erfundenen konkreten Fakten.",
         "Bei Stille das Gespräch mit einer klaren Nachfrage weiterführen.",
       ].join("\n"),
       [
         "### TELEFON-STIL",
-        "Sprich klares, gut verständliches Hochdeutsch.",
-        "Kurze, präzise Sätze statt langer verschachtelter Formulierungen.",
-        "Kein Slang oder umgangssprachliche Ausdrücke.",
-        "Ruhiges, natürliches Tempo mit kurzen Pausen.",
+        "Sprich wie in einem gewohnten Geschäftstelefonat: klares Hochdeutsch, normal bis etwas flotter — nicht träge, nicht stockend, nicht eintönig schleppend.",
+        "Keine Fülllaute, kein Stocken mitten im Satz; durchgehend flüssig.",
+        "Silben nicht unnötig ziehen; nicht monoton dröhnen und nicht nuscheln.",
+        "Telefon/Sprachausgabe: jedes Wort artikuliert; Umlaute und auslautende Konsonanten klar — höchste Verständlichkeit für den Anrufer.",
+        "Kurze, prägnante Sätze; keine langen geschachtelten Formulierungen.",
+        "Ruhiges, stabiles aber lebendiges Tempo; keine monotonen Roboter­phrasen.",
         "Maximal eine fokussierte Frage pro Aussage.",
+        "Sprache: Standard Deutsch; wenn die Rollenbeschreibung ausdrücklich Fremdsprachenunterricht verlangt, Unterrichtsteil in der Zielsprache.",
       ].join("\n"),
     ],
   };
 
   const [head, tail] = blocks[locale];
 
+  const userScenarioHeading: Record<CallLocale, string> = {
+    tr: "### KULLANICI TANIMI (ekrandan gelen tam metin)",
+    en: "### USER PERSONA & TASK (full scenario text from this session)",
+    de: "### NUTZERROLLE UND AUFGABE (vollständiger Szenariotext dieser Sitzung)",
+  };
+
   return [
     head,
     "",
-    "### KULLANICI TANIMI (ekrandan gelen tam metin)",
+    userScenarioHeading[locale],
     clientPromptBundle.trim(),
     "",
     tail,
   ].join("\n");
+}
+
+/** Özel senaryo: istemci ham kullanıcı metni gönderir; kurumsal augment yalnızca burada uygulanır (TR/EN/DE tutarlı). */
+function splitCallerPersonaAndSystemTail(fullPrompt: string): {
+  callerLine: string;
+  personaRaw: string;
+  tail: string;
+} | null {
+  const boundaryToken = `\n${ANSEL_CALL_SYSTEM_BOUNDARY}\n`;
+  let head: string;
+  let tail: string;
+
+  const b = fullPrompt.indexOf(boundaryToken);
+  if (b !== -1) {
+    head = fullPrompt.slice(0, b).trimEnd();
+    tail = fullPrompt.slice(b + boundaryToken.length);
+  } else {
+    const marker = "══════════════════════════════════════";
+    const idx = fullPrompt.indexOf(marker);
+    if (idx === -1) return null;
+    head = fullPrompt.slice(0, idx).trimEnd();
+    tail = fullPrompt.slice(idx);
+  }
+
+  const lines = head.split("\n");
+  if (
+    lines.length < 2 ||
+    !/^Caller name:\s*/i.test(lines[0] ?? "")
+  ) {
+    return null;
+  }
+  const callerMatch = lines[0]?.match(/^Caller name:\s*(.+)$/i);
+  if (!callerMatch) return null;
+  const callerName = callerMatch[1].trim();
+  const personaRaw = lines.slice(1).join("\n").trim();
+  return {
+    callerLine: `Caller name: ${callerName}`,
+    personaRaw,
+    tail,
+  };
+}
+
+function applyCustomScenarioServerAugment(
+  fullPrompt: string,
+  locale: CallLocale,
+  presetId: string | null,
+): string {
+  if (presetId !== "custom") return fullPrompt;
+
+  const parsed = splitCallerPersonaAndSystemTail(fullPrompt);
+  if (!parsed) return fullPrompt;
+
+  const { callerLine, personaRaw, tail } = parsed;
+  if (!personaRaw) return fullPrompt;
+
+  if (
+    personaRaw.includes("CUSTOM SCENARIO — ENTERPRISE") ||
+    personaRaw.includes("ÖZEL SENARYO — KURUMSAL") ||
+    personaRaw.includes("EIGENES SZENARIO — PROFESSIONELLE")
+  ) {
+    return fullPrompt;
+  }
+
+  const augmented = augmentCustomScenarioDraft(personaRaw, locale);
+  return `${callerLine}\n${augmented}\n\n${ANSEL_CALL_SYSTEM_BOUNDARY}\n${tail}`;
 }
 
 export async function POST(request: Request) {
@@ -461,6 +584,15 @@ export async function POST(request: Request) {
     typeof (body as { systemPrompt?: unknown }).systemPrompt === "string"
       ? (body as { systemPrompt: string }).systemPrompt.trim()
       : "";
+  const firstMessageFromBody =
+    body &&
+    typeof body === "object" &&
+    "firstMessage" in body &&
+    typeof (body as { firstMessage?: unknown }).firstMessage === "string"
+      ? sanitizeOutboundFirstMessage(
+          (body as { firstMessage: string }).firstMessage,
+        )
+      : null;
   const voiceIdFromBody =
     body &&
     typeof body === "object" &&
@@ -471,7 +603,7 @@ export async function POST(request: Request) {
   const voiceId =
     process.env.VAPI_VOICE_VOICE_ID?.trim() ||
     voiceIdFromBody ||
-    "Nisa/v3";
+    ELEVENLABS_VOICE_ID_SARAH;
 
   if (!phoneNumberRaw) {
     return NextResponse.json(
@@ -493,6 +625,15 @@ export async function POST(request: Request) {
 
   const locale = resolveCallLocale(body);
   const sector = parseCallSector(body);
+  const presetId = parsePresetId(body);
+  const ip = getClientIpFromHeaders(new Headers(request.headers));
+
+  if (await isIpBlocked(ip)) {
+    return NextResponse.json(
+      { error: blockedSiteMessage(locale) },
+      { status: 403 },
+    );
+  }
 
   if (!systemPromptRaw) {
     return NextResponse.json(
@@ -500,6 +641,21 @@ export async function POST(request: Request) {
       { status: 400 },
     );
   }
+
+  const abuseScan = scanPromptForAbuse(systemPromptRaw);
+  if (!abuseScan.ok) {
+    await blockIpPersist(ip);
+    return NextResponse.json(
+      { error: abuseMessageForLocale(abuseScan, locale) },
+      { status: 403 },
+    );
+  }
+
+  const systemPromptAugmented = applyCustomScenarioServerAugment(
+    systemPromptRaw,
+    locale,
+    presetId,
+  );
 
   const rateGrant =
     body &&
@@ -509,7 +665,6 @@ export async function POST(request: Request) {
       ? (body as { rateGrant: string }).rateGrant.trim()
       : "";
 
-  const ip = getClientIpFromHeaders(new Headers(request.headers));
   const rateLimitResult = consumeRateGrant({
     grantId: rateGrant,
     ip,
@@ -530,8 +685,10 @@ export async function POST(request: Request) {
     buildLanguagePrompts(locale);
   const sectorPrompts = sector ? buildSectorPrompts(locale, sector) : null;
   const MAX_PROMPT_CHARS = 22_000;
-  const enhancedPrompt = enhancePromptForVoiceCall(systemPromptRaw, locale);
-  const lockedPrompt = `${localeSystemPrompt}${sectorPrompts ? `\n\n${sectorPrompts.systemPrompt}` : ""}\n\n${enhancedPrompt}\n\n${SERVER_LOCALE_LOCK[locale]}`;
+  const enhancedPrompt = enhancePromptForVoiceCall(systemPromptAugmented, locale);
+  /** Senaryo ve kullanıcı talimatı önce — genel Ansel kimliği sonra (özel senaryonun ezilmesini önler). */
+  const lockedPromptCore = `${enhancedPrompt}\n\n────────────────────────────────────────\n\n${localeSystemPrompt}${sectorPrompts ? `\n\n${sectorPrompts.systemPrompt}` : ""}\n\n${SERVER_LOCALE_LOCK[locale]}`;
+  const lockedPrompt = appendSecurityToSystemPrompt(lockedPromptCore, locale);
   if (lockedPrompt.length > MAX_PROMPT_CHARS) {
     return NextResponse.json(
       { error: "Sistem promptu çok uzun." },
@@ -554,10 +711,7 @@ export async function POST(request: Request) {
     await fetchAssistantPayload(assistantId, privateKey);
 
   const modelOverride = buildAssistantModelOverride(baseModel, lockedPrompt);
-  const voiceOverride = buildVoiceOverride(
-    locale,
-    voiceId || "Nisa/v3",
-  );
+  const voiceOverride = buildVoiceOverride(voiceId);
   const transcriberOverride = buildTranscriberOverride(
     baseTranscriber,
     locale,
@@ -565,13 +719,17 @@ export async function POST(request: Request) {
 
   const assistantOverrides: Record<string, unknown> = {
     model: modelOverride,
-    firstMessage: sectorPrompts?.firstMessage || localeFirstMessage,
+    firstMessage:
+      firstMessageFromBody ??
+      sectorPrompts?.firstMessage ??
+      localeFirstMessage,
     /** PSTN varsayılanı «office» ortam sesi — kapatılır. */
     backgroundSound: "off",
+    voice: voiceOverride,
+    maxDurationSeconds: MAX_CALL_DURATION_SECONDS,
+    endCallPhrases: VAPI_END_CALL_PHRASES,
+    endCallMessage: endCallMessageForLocale(locale),
   };
-  if (voiceOverride) {
-    assistantOverrides.voice = voiceOverride;
-  }
   if (transcriberOverride) {
     assistantOverrides.transcriber = transcriberOverride;
   }
@@ -581,6 +739,8 @@ export async function POST(request: Request) {
     rawText: string;
     parsed: unknown;
   };
+
+  const customerDialNumber = formatGermanDialForCarrier(phoneE164, locale);
 
   const createCall = async (
     overrides: Record<string, unknown>,
@@ -594,7 +754,7 @@ export async function POST(request: Request) {
       body: JSON.stringify({
         assistantId,
         phoneNumberId,
-        customer: { number: phoneE164 },
+        customer: { number: customerDialNumber },
         assistantOverrides: overrides,
       }),
     });

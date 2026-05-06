@@ -11,12 +11,13 @@ export function AuroraPlasmaCanvas({ className = "" }: { className?: string }) {
     const coarsePointer =
       typeof window !== "undefined" &&
       window.matchMedia("(pointer: coarse)").matches;
-    const gl =
+    const glRaw =
       canvas.getContext("webgl", {
         alpha: true,
         antialias: !coarsePointer,
         premultipliedAlpha: true,
       }) ?? canvas.getContext("experimental-webgl");
+    const gl = glRaw as WebGLRenderingContext | null;
     if (!gl) return;
 
     const HISTORY = 12;
