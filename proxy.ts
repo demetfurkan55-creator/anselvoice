@@ -47,7 +47,8 @@ function getClientIp(request: NextRequest): string {
   return forwarded || realIp || "unknown";
 }
 
-export function middleware(request: NextRequest) {
+/** Next.js 16+: `middleware` konumu `proxy` olarak yeniden adlandırıldı (aynı Edge davranışı). */
+export function proxy(request: NextRequest) {
   const ip = getClientIp(request);
   if (isIpBlockedEdge(ip)) {
     const locale = resolveLocaleFromRequest({
